@@ -402,7 +402,13 @@ YAML
 # Свою проверку TXT Caddy не делает (propagation_timeout -1): на нодах, где DNS режут или он
 # тормозит, она зависала навсегда. Cloudflare публикует запись за секунды, 30 секунд ожидания с запасом
 server=$(server_header "$template")
-status=''; [ "$template" = nginx-403 ] && status=' { status 403 }'
+
+# Значение в кавычках: без них «nginx/1.24.0 (Ubuntu)» Caddy читает как «найти и заменить» и заголовок не ставит
+header_line=''
+[ -n "$server" ] && header_line="header Server \"$server\""
+# Блок только многострочный: { status 403 } в одну строку Caddy не принимает и падает на старте
+files='file_server'
+[ "$template" = nginx-403 ] && files=$'file_server {\n        status 403\n    }'
 cat > Caddyfile <<CADDY
 {
     auto_https disable_redirects
@@ -418,11 +424,19 @@ cat > Caddyfile <<CADDY
         eab {env.ZEROSSL_KID} {env.ZEROSSL_HMAC}
     }
     header -Server
-    ${server:+header Server "$server"}
+    $header_line
     root * /srv
-    file_server$status
+    $files
 }
 CADDY
+
+# Проверяем Caddyfile до замка: с ошибкой в конфиге Caddy падает по кругу и сертификат не выпускает
+if ! out=$(docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" ghcr.io/caddybuilds/caddy-cloudflare:latest \
+        caddy adapt --config /etc/caddy/Caddyfile 2>&1 >/dev/null); then
+    echo "ОШИБКА $ip: Caddy не принял Caddyfile:"
+    echo "$out" | tail -3
+    exit 1
+fi
 
 # ─── Cloudflare API: зона и замок ────────────────────────────────────────────
 cf() { curl -s -m 20 -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' "$@"; }
@@ -507,5 +521,5 @@ for attempt in 1 2 3; do
 done
 
 echo "ОШИБКА $ip: сертификат не получен за 3 попытки. Последние строки Caddy:"
-docker compose logs caddy --since 15m 2>&1 | grep -Ei 'error|challenge' | tail -5
+docker compose logs caddy --since 15m 2>&1 | grep -Ei 'error|challenge' | tail -5 | cut -c1-300
 exit 1
