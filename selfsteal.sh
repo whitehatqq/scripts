@@ -16,7 +16,7 @@
 #          bash /root/selfsteal.sh --reset   то же, но сертификат и аккаунт ZeroSSL с нуля
 #          bash /root/selfsteal.sh --check   проверка для cron: всё живо и сертификату больше 21 дня —
 #                                            ничего не делает, иначе чинит как обычный запуск
-# После успешной установки скрипт сам ставит ежедневную проверку в cron (лог /var/log/selfsteal.log).
+# При каждом запуске скрипт сам ставит ежедневную проверку в cron (лог /var/log/selfsteal.log).
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -488,12 +488,14 @@ install_cron() {
     ( crontab -l 2>/dev/null | grep -v 'selfsteal.sh' || true; echo "$line" ) | crontab -
 }
 
+# Ставим сразу, до ожидания: если выпуск не удастся или запуск прервут, cron повторит ночью
+install_cron
+
 # Ждём до 4 минут; завис — чистим TXT и перезапускаем Caddy, всего три попытки
 for attempt in 1 2 3; do
     for i in $(seq 1 48); do
         sleep 5
         if cert_ok; then
-            install_cron
             echo "OK $ip | $template | сертификат до $(cert_end)"
             exit 0
         fi
