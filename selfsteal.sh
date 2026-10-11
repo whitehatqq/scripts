@@ -10,15 +10,46 @@
 #       постоянный. Нет файла — вопрос: шаблон по умолчанию или свой HTML до строки END.
 #       Сменить страницу: rm /root/caddy/site/index.html и запустить снова.
 # Сертификат: wildcard *.vpnon-connect.tech от ZeroSSL, проверка домена через DNS Cloudflare.
-# Повторный запуск безопасен: контейнер и сертификат пересоздаются с нуля.
+#             Завис выпуск — скрипт сам перезапускает Caddy, до трёх попыток.
+#
+# Запуск:  bash /root/selfsteal.sh           установить или починить (сертификат из тома сохраняется)
+#          bash /root/selfsteal.sh --reset   то же, но сертификат и аккаунт ZeroSSL с нуля
+#          bash /root/selfsteal.sh --check   проверка для cron: всё живо и сертификату больше 21 дня —
+#                                            ничего не делает, иначе чинит как обычный запуск
+# После успешной установки скрипт сам ставит ежедневную проверку в cron (лог /var/log/selfsteal.log).
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 zone_name=vpnon-connect.tech
 lock_name="_selfsteal-lock.$zone_name"
-lock_ttl=900
+lock_ttl=1200
+mode=${1:-}
 ip=$(hostname -I | awk '{print $1}')
+
+# Cron вызывает /root/selfsteal.sh — кладём туда копию, если запустили из другого места
+self=$(readlink -f "$0" 2>/dev/null || true)
+[ -f "$self" ] && [ "$self" != /root/selfsteal.sh ] && cp "$self" /root/selfsteal.sh
 mkdir -p /root/caddy/site && cd /root/caddy
+
+# Нода в порядке: страница отвечает на 8443 и сертификат действует ещё больше 21 дня
+cert_ok() {
+    curl -sk -m 10 -o /dev/null --resolve "ru.$zone_name:8443:127.0.0.1" "https://ru.$zone_name:8443" || return 1
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "ru.$zone_name" 2>/dev/null \
+        | openssl x509 -noout -checkend $((21 * 86400)) >/dev/null 2>&1
+}
+cert_end() {
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "ru.$zone_name" 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2
+}
+
+# Проверка из cron: всё в порядке — выходим, ничего не трогая
+if [ "$mode" = --check ]; then
+    if cert_ok; then
+        echo "$(date '+%F %T') OK $ip, сертификат до $(cert_end)"
+        exit 0
+    fi
+    echo "$(date '+%F %T') $ip: страница не отвечает или сертификат скоро истечёт — чиним"
+fi
 
 # ─── Ключи ───────────────────────────────────────────────────────────────────
 touch .env && chmod 600 .env
@@ -368,7 +399,8 @@ volumes:
 YAML
 
 # Заголовок Server — под выбранную страницу, у 403 ещё и код ответа.
-# Проверку TXT делаем через резолверы Cloudflare: локальный DNS ноды может долго не видеть запись
+# Свою проверку TXT Caddy не делает (propagation_timeout -1): на нодах, где DNS режут или он
+# тормозит, она зависала навсегда. Cloudflare публикует запись за секунды, 30 секунд ожидания с запасом
 server=$(server_header "$template")
 status=''; [ "$template" = nginx-403 ] && status=' { status 403 }'
 cat > Caddyfile <<CADDY
@@ -380,8 +412,8 @@ cat > Caddyfile <<CADDY
 *.$zone_name {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
-        resolvers 1.1.1.1 1.0.0.1
-        propagation_delay 20s
+        propagation_delay 30s
+        propagation_timeout -1
         ca https://acme.zerossl.com/v2/DV90
         eab {env.ZEROSSL_KID} {env.ZEROSSL_HMAC}
     }
@@ -410,7 +442,7 @@ lock_id=''
 release() { [ -n "$lock_id" ] && delete "$lock_id" && echo 'Замок снят' || true; }
 trap release EXIT
 
-# Замок: сертификат в один момент времени выпускает одна нода. Замок старше 15 минут считаем брошенным
+# Замок: сертификат в один момент времени выпускает одна нода. Замок старше 20 минут считаем брошенным
 echo "Нода $ip: становимся в очередь на выпуск сертификата"
 while :; do
     taken=''
@@ -436,22 +468,42 @@ done
 echo 'Замок наш'
 
 # Под замком чужих выпусков нет: все TXT _acme-challenge — брошенные, убираем
-records "_acme-challenge.$zone_name" | cut -d' ' -f1 | while read -r id; do [ -n "$id" ] && delete "$id"; done
+clean_challenges() {
+    records "_acme-challenge.$zone_name" | cut -d' ' -f1 | while read -r id; do [ -n "$id" ] && delete "$id"; done
+}
+clean_challenges
 
-# ─── Чистый старт Caddy ──────────────────────────────────────────────────────
-docker compose down -v >/dev/null 2>&1 || true
-docker compose up -d >/dev/null
-echo 'Caddy запущен, ждём сертификат от ZeroSSL (до 10 минут)...'
+# ─── Старт Caddy ─────────────────────────────────────────────────────────────
+# Обычный запуск сохраняет том: действующий сертификат подхватится без нового выпуска
+if [ "$mode" = --reset ]; then
+    docker compose down -v >/dev/null 2>&1 || true
+fi
+docker compose up -d --force-recreate >/dev/null
+echo 'Caddy запущен, ждём сертификат от ZeroSSL...'
 
-check() { curl -sk --resolve "ru.$zone_name:8443:127.0.0.1" "https://ru.$zone_name:8443" | grep -qi '<html'; }
-for i in $(seq 1 120); do
-    sleep 5
-    if check; then
-        echo "OK $ip: сертификат получен, страница «$template» отвечает на 127.0.0.1:8443"
-        exit 0
-    fi
+# Ежедневная проверка в cron, минута — по IP, чтобы ноды не шли одновременно
+install_cron() {
+    command -v crontab >/dev/null || { echo 'cron не установлен — автопроверки не будет'; return; }
+    local line="$(( ${ip##*.} % 60 )) 4 * * * bash /root/selfsteal.sh --check >> /var/log/selfsteal.log 2>&1"
+    ( crontab -l 2>/dev/null | grep -v 'selfsteal.sh' || true; echo "$line" ) | crontab -
+}
+
+# Ждём до 4 минут; завис — чистим TXT и перезапускаем Caddy, всего три попытки
+for attempt in 1 2 3; do
+    for i in $(seq 1 48); do
+        sleep 5
+        if cert_ok; then
+            install_cron
+            echo "OK $ip | $template | сертификат до $(cert_end)"
+            exit 0
+        fi
+    done
+    [ "$attempt" -lt 3 ] || break
+    echo "Попытка $attempt: сертификата нет 4 минуты, перезапускаем Caddy"
+    clean_challenges
+    docker compose restart >/dev/null
 done
 
-echo "ОШИБКА $ip: сертификат не получен. Последние ошибки Caddy:"
-docker compose logs caddy --since 12m | grep -i error | tail -3
+echo "ОШИБКА $ip: сертификат не получен за 3 попытки. Последние строки Caddy:"
+docker compose logs caddy --since 15m 2>&1 | grep -Ei 'error|challenge' | tail -5
 exit 1
