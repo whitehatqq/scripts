@@ -5,12 +5,16 @@
 # Один скрипт на все ноды, можно запускать на всех одновременно: ноды выстраиваются
 # в очередь через замок в DNS Cloudflare и выпускают сертификат по одной.
 #
+# Домен: переменная ZONE → /root/caddy/.env → vpnon-connect.tech. Сертификат на *.домен, домен — зона в Cloudflare.
+#        Другой домен: ZONE=example.org bash /root/selfsteal.sh — запомнится в .env.
 # Ключи: переменные окружения CF_API_TOKEN, ZEROSSL_KID, ZEROSSL_HMAC → /root/caddy/.env → вопрос.
 # Сайт: /root/caddy/site/index.html — одна из стандартных страниц веб-серверов, выбор по IP ноды,
 #       постоянный. Нет файла — вопрос: шаблон по умолчанию или свой HTML до строки END.
 #       Сменить страницу: rm /root/caddy/site/index.html и запустить снова.
-# Сертификат: wildcard *.vpnon-connect.tech от ZeroSSL, проверка домена через DNS Cloudflare.
+# Сертификат: wildcard *.домен от ZeroSSL, проверка домена через DNS Cloudflare.
 #             Завис выпуск — скрипт сам перезапускает Caddy, до трёх попыток.
+# В конце самопроверка: заголовки, чужое имя и путь, запрос без имени, порт 8443 закрыт снаружи.
+#             OK пишется, только если всё чисто
 #
 # Запуск:  bash /root/selfsteal.sh           установить или починить (сертификат из тома сохраняется)
 #          bash /root/selfsteal.sh --reset   то же, но сертификат и аккаунт ZeroSSL с нуля
@@ -20,8 +24,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-zone_name=vpnon-connect.tech
-lock_name="_selfsteal-lock.$zone_name"
 lock_ttl=1200
 mode=${1:-}
 ip=$(hostname -I | awk '{print $1}')
@@ -30,18 +32,29 @@ ip=$(hostname -I | awk '{print $1}')
 self=$(readlink -f "$0" 2>/dev/null || true)
 [ -f "$self" ] && [ "$self" != /root/selfsteal.sh ] && cp "$self" /root/selfsteal.sh
 mkdir -p /root/caddy/site && cd /root/caddy
+touch .env && chmod 600 .env
+
+# Домен: переменная ZONE → .env → vpnon-connect.tech. Без вопроса: в фоне и из cron спросить некого
+zone_name=${ZONE:-$(grep -s '^ZONE=' .env | cut -d= -f2- || true)}
+zone_name=${zone_name:-vpnon-connect.tech}
+grep -q '^ZONE=' .env && sed -i "s|^ZONE=.*|ZONE=$zone_name|" .env || echo "ZONE=$zone_name" >> .env
+lock_name="_selfsteal-lock.$zone_name"
+
+# Имена для проверок: своё — любое под звёздочку сертификата, чужое — заведомо не наше
+own_host="www.$zone_name"
+foreign_host=example.com
 
 # Нода в порядке: страница отвечает на 8443, на чужое имя тоже есть ответ TLS (см. fallback_sni)
 # и сертификат действует ещё больше 21 дня
 cert_ok() {
-    curl -sk -m 10 -o /dev/null --resolve "ru.$zone_name:8443:127.0.0.1" "https://ru.$zone_name:8443" || return 1
-    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername fortwine.ru 2>/dev/null \
+    curl -sk -m 10 -o /dev/null --resolve "$own_host:8443:127.0.0.1" "https://$own_host:8443" || return 1
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "$foreign_host" 2>/dev/null \
         | grep -c 'BEGIN CERTIFICATE' >/dev/null || return 1
-    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "ru.$zone_name" 2>/dev/null \
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "$own_host" 2>/dev/null \
         | openssl x509 -noout -checkend $((21 * 86400)) >/dev/null 2>&1
 }
 cert_end() {
-    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "ru.$zone_name" 2>/dev/null \
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "$own_host" 2>/dev/null \
         | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2
 }
 
@@ -55,7 +68,6 @@ if [ "$mode" = --check ]; then
 fi
 
 # ─── Ключи ───────────────────────────────────────────────────────────────────
-touch .env && chmod 600 .env
 key() {
     local value="${!1:-}"
     [ -n "$value" ] || value=$(grep -s "^$1=" .env | cut -d= -f2- || true)
@@ -397,6 +409,11 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./site:/srv:ro
       - data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '2'
 volumes:
   data:
 YAML
@@ -413,24 +430,28 @@ header_line='header -Server'
 # Блок только многострочный: { status 403 } в одну строку Caddy не принимает и падает на старте
 files='file_server'
 [ "$template" = nginx-403 ] && files=$'file_server {\n        status 403\n    }'
-# fallback_sni: на чужое имя (fortwine.ru, пока он в serverNames) Caddy отвечает нашим сертификатом.
+# fallback_sni: на чужое имя (например, старый sni клиентов, пока он в serverNames) Caddy отвечает нашим сертификатом.
 # Без этого он рвёт рукопожатие, а REALITY пускает клиента, только если dest прислал ServerHello —
 # клиенты со старым sni после переключения dest перестали бы подключаться.
 # Имя — ровно как в сертификате, со звёздочкой: Caddy ищет его буквально, на ru.… сертификат не находился.
 # default_bind: слушаем только 127.0.0.1 — снаружи 8443 закрыт, к Caddy ходит только Xray этой ноды.
-# protocols h1 h2: без HTTP/3, иначе Caddy слушает UDP и в каждом ответе пишет Alt-Svc h3=":8443" — выдаёт порт
-cat > Caddyfile <<CADDY
+# protocols h1 h2: без HTTP/3, иначе Caddy слушает UDP и в каждом ответе пишет Alt-Svc h3=":8443" — выдаёт порт.
+# default_sni: запрос вовсе без имени (сканер по голому IP) тоже получает наш сертификат.
+# Сайт отвечает на любое имя (https://) и на любой путь (try_files): иначе на чужое имя или путь
+# Caddy отдавал пустую страницу с «Server: Caddy» — так nginx и Apache себя не ведут
+cat > Caddyfile.new <<CADDY
 {
     auto_https disable_redirects
     https_port 8443
     default_bind 127.0.0.1
+    default_sni *.$zone_name
     fallback_sni *.$zone_name
     servers {
         protocols h1 h2
     }
 }
 
-*.$zone_name {
+*.$zone_name, https:// {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
         propagation_delay 30s
@@ -440,17 +461,20 @@ cat > Caddyfile <<CADDY
     }
     $header_line
     root * /srv
+    try_files {path} /index.html
     $files
 }
 CADDY
 
-# Проверяем Caddyfile до замка: с ошибкой в конфиге Caddy падает по кругу и сертификат не выпускает
-if ! out=$(docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" ghcr.io/caddybuilds/caddy-cloudflare:latest \
+# Проверяем новый Caddyfile до замка и только потом ставим вместо рабочего: с ошибкой в конфиге Caddy
+# падает по кругу, а после переключения dest на него без Caddy не пускает и VPN
+if ! out=$(docker run --rm -v "$PWD/Caddyfile.new:/etc/caddy/Caddyfile:ro" ghcr.io/caddybuilds/caddy-cloudflare:latest \
         caddy adapt --config /etc/caddy/Caddyfile 2>&1 >/dev/null); then
-    echo "ОШИБКА $ip: Caddy не принял Caddyfile:"
+    echo "ОШИБКА $ip: Caddy не принял новый Caddyfile, рабочий не тронут:"
     echo "$out" | tail -3
     exit 1
 fi
+mv Caddyfile.new Caddyfile
 
 # ─── Cloudflare API: зона и замок ────────────────────────────────────────────
 cf() { curl -s -m 20 -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' "$@"; }
@@ -519,13 +543,55 @@ install_cron() {
 # Ставим сразу, до ожидания: если выпуск не удастся или запуск прервут, cron повторит ночью
 install_cron
 
+# Самопроверка глазами проверяющего: всё, что выдало бы подмену. Печатает найденное, при находках — код 1
+verify() {
+    local problems=() hdr main srv other path tcp udp
+
+    # Наше имя: код ответа и заголовок Server ровно под шаблон, без Alt-Svc
+    hdr=$(curl -sk -m 10 -D - -o /dev/null --resolve "$own_host:8443:127.0.0.1" "https://$own_host:8443/")
+    main=$(echo "$hdr" | awk 'NR==1{print $2}')
+    srv=$(echo "$hdr" | grep -i '^server:' | cut -d' ' -f2- | tr -d '\r' || true)
+    [ "$srv" = "$server" ] || problems+=("заголовок Server «${srv:-нет}», ждали «${server:-нет}»")
+    grep -qi '^alt-svc' <<< "$hdr" && problems+=('в ответе есть Alt-Svc (HTTP/3)')
+
+    # Чужое имя и случайный путь отвечают так же, как главная
+    other=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "$foreign_host:8443:127.0.0.1" "https://$foreign_host:8443/")
+    [ "$other" = "$main" ] || problems+=("чужое имя отвечает $other, а наше $main")
+    path=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "$own_host:8443:127.0.0.1" "https://$own_host:8443/robots.txt")
+    [ "$path" = "$main" ] || problems+=("случайный путь отвечает $path, а главная $main")
+
+    # Рукопожатие с чужим именем и вовсе без имени: нужно REALITY и сканерам по голому IP
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "$foreign_host" 2>/dev/null \
+        | grep -c 'BEGIN CERTIFICATE' >/dev/null || problems+=('на чужое имя нет сертификата (fallback_sni)')
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -noservername 2>/dev/null \
+        | grep -c 'BEGIN CERTIFICATE' >/dev/null || problems+=('без имени нет сертификата (default_sni)')
+
+    # Снаружи 8443 закрыт: только 127.0.0.1 и только TCP
+    tcp=$(ss -ltn | awk '{print $4}' | grep ':8443$' || true)
+    udp=$(ss -lun | awk '{print $4}' | grep ':8443$' || true)
+    [ -n "$tcp" ] && grep -qv '^127\.0\.0\.1:8443$' <<< "$tcp" && problems+=('8443 слушает не только 127.0.0.1')
+    [ -n "$udp" ] && problems+=('8443 слушает UDP (HTTP/3)')
+
+    # Итог: пусто — всё чисто
+    [ ${#problems[@]} -eq 0 ] && return 0
+    printf '  - %s\n' "${problems[@]}"
+    return 1
+}
+
 # Ждём до 4 минут; завис — чистим TXT и перезапускаем Caddy, всего три попытки
 for attempt in 1 2 3; do
     for i in $(seq 1 48); do
         sleep 5
         if cert_ok; then
-            echo "OK $ip | $template | сертификат до $(cert_end)"
-            exit 0
+
+            # Сертификат есть — проверяем, что прикрытие не выдаёт себя
+            if found=$(verify); then
+                echo "OK $ip | $template | сертификат до $(cert_end) | самопроверка пройдена"
+                exit 0
+            fi
+            echo "ОШИБКА $ip: сертификат есть, но самопроверка нашла:"
+            echo "$found"
+            exit 1
         fi
     done
     [ "$attempt" -lt 3 ] || break
