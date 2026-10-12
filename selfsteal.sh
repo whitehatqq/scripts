@@ -406,20 +406,28 @@ YAML
 # тормозит, она зависала навсегда. Cloudflare публикует запись за секунды, 30 секунд ожидания с запасом
 server=$(server_header "$template")
 
-# Значение в кавычках: без них «nginx/1.24.0 (Ubuntu)» Caddy читает как «найти и заменить» и заголовок не ставит
-header_line=''
+# Значение в кавычках: без них «nginx/1.24.0 (Ubuntu)» Caddy читает как «найти и заменить» и заголовок не ставит.
+# Ставим или удаляем — что-то одно: удаление у Caddy срабатывает после установки и стёрло бы значение
+header_line='header -Server'
 [ -n "$server" ] && header_line="header Server \"$server\""
 # Блок только многострочный: { status 403 } в одну строку Caddy не принимает и падает на старте
 files='file_server'
 [ "$template" = nginx-403 ] && files=$'file_server {\n        status 403\n    }'
 # fallback_sni: на чужое имя (fortwine.ru, пока он в serverNames) Caddy отвечает нашим сертификатом.
 # Без этого он рвёт рукопожатие, а REALITY пускает клиента, только если dest прислал ServerHello —
-# клиенты со старым sni после переключения dest перестали бы подключаться
+# клиенты со старым sni после переключения dest перестали бы подключаться.
+# Имя — ровно как в сертификате, со звёздочкой: Caddy ищет его буквально, на ru.… сертификат не находился.
+# default_bind: слушаем только 127.0.0.1 — снаружи 8443 закрыт, к Caddy ходит только Xray этой ноды.
+# protocols h1 h2: без HTTP/3, иначе Caddy слушает UDP и в каждом ответе пишет Alt-Svc h3=":8443" — выдаёт порт
 cat > Caddyfile <<CADDY
 {
     auto_https disable_redirects
     https_port 8443
-    fallback_sni ru.$zone_name
+    default_bind 127.0.0.1
+    fallback_sni *.$zone_name
+    servers {
+        protocols h1 h2
+    }
 }
 
 *.$zone_name {
@@ -430,7 +438,6 @@ cat > Caddyfile <<CADDY
         ca https://acme.zerossl.com/v2/DV90
         eab {env.ZEROSSL_KID} {env.ZEROSSL_HMAC}
     }
-    header -Server
     $header_line
     root * /srv
     $files
