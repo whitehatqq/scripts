@@ -31,9 +31,12 @@ self=$(readlink -f "$0" 2>/dev/null || true)
 [ -f "$self" ] && [ "$self" != /root/selfsteal.sh ] && cp "$self" /root/selfsteal.sh
 mkdir -p /root/caddy/site && cd /root/caddy
 
-# Нода в порядке: страница отвечает на 8443 и сертификат действует ещё больше 21 дня
+# Нода в порядке: страница отвечает на 8443, на чужое имя тоже есть ответ TLS (см. fallback_sni)
+# и сертификат действует ещё больше 21 дня
 cert_ok() {
     curl -sk -m 10 -o /dev/null --resolve "ru.$zone_name:8443:127.0.0.1" "https://ru.$zone_name:8443" || return 1
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername fortwine.ru 2>/dev/null \
+        | grep -c 'BEGIN CERTIFICATE' >/dev/null || return 1
     echo | timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername "ru.$zone_name" 2>/dev/null \
         | openssl x509 -noout -checkend $((21 * 86400)) >/dev/null 2>&1
 }
@@ -409,10 +412,14 @@ header_line=''
 # Блок только многострочный: { status 403 } в одну строку Caddy не принимает и падает на старте
 files='file_server'
 [ "$template" = nginx-403 ] && files=$'file_server {\n        status 403\n    }'
+# fallback_sni: на чужое имя (fortwine.ru, пока он в serverNames) Caddy отвечает нашим сертификатом.
+# Без этого он рвёт рукопожатие, а REALITY пускает клиента, только если dest прислал ServerHello —
+# клиенты со старым sni после переключения dest перестали бы подключаться
 cat > Caddyfile <<CADDY
 {
     auto_https disable_redirects
     https_port 8443
+    fallback_sni ru.$zone_name
 }
 
 *.$zone_name {
