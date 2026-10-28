@@ -1,8 +1,8 @@
 #!/bin/bash
 # Сбор с ноды для главного сервера: пары «клиент + IP», попытки торрента и баны блокеров.
 # Нода раз в 5 минут складывает их в файл, главный сервер забирает по SSH ключом, который
-# умеет только это. Сайты, которые открывают клиенты, никуда не уходят, а сам журнал Xray
-# обрезается раз в час: на ноде он живёт не дольше часа.
+# умеет только это. Сайты, которые открывают клиенты, никуда не уходят. Журнал Xray скрипт
+# только читает: ротацию журнала настраивают отдельно, вместе с логом в ядре.
 #
 # Строки файла:
 #   123456 203.0.113.10                           — пара: клиент и IP
@@ -24,8 +24,7 @@ log=/var/lib/pg-node/access.log
 # Нужен root
 [ "$(id -u)" = 0 ] || { echo "Запустите от root"; exit 1; }
 
-# Удаление: пользователь, скрипты, cron и данные. Ротация журнала остаётся — без часовой
-# обрезки она держит журнал не дольше суток
+# Удаление: пользователь, скрипты, cron и данные
 if [ "${1:-}" = "--remove" ]; then
     rm -f /etc/cron.d/node-ips /usr/local/bin/node-ips /usr/local/bin/node-ips-get
     id "$user" >/dev/null 2>&1 && userdel "$user"
@@ -86,16 +85,6 @@ if [ "$cur_inode" != "$inode" ] || [ "$size" -lt "$pos" ]; then pos=0; fi
 # Забираем новый кусок лога разом — дальше разбираем копию
 chunk=$state/chunk
 tail -c +"$((pos + 1))" "$log" | head -c "$((size - pos))" > "$chunk"
-
-# Раз в час обрезаем журнал сразу после копии: сайты клиентов живут на ноде не дольше часа.
-# Xray пишет журнал с O_APPEND и продолжит с начала файла. p2pban смотрит последние 10 минут
-# журнала — после обрезки его окно неполное до 10 минут раз в час
-hour=$(date -u +%Y%m%d%H)
-if [ "$(cat "$state/cut" 2>/dev/null)" != "$hour" ]; then
-    truncate -s 0 "$log"
-    echo "$hour" > "$state/cut"
-    size=0
-fi
 echo "$cur_inode $size" > "$pos_file"
 
 file="$out/$(date -u +%Y%m%d%H%M).txt"
@@ -184,11 +173,6 @@ esac
 EOF
 chmod 755 /usr/local/bin/node-ips /usr/local/bin/node-ips-get
 
-# Ротация журнала — страховка, если сборщик остановится: раз в сутки обрезать без архивов.
-# Старые архивы с сайтами клиентов удаляем
-printf '%s {\n    daily\n    rotate 0\n    missingok\n    notifempty\n    copytruncate\n}\n' "$log" > /etc/logrotate.d/pg-node-access
-rm -f "$log".[0-9]* "$log"-[0-9]*
-
 # Расписание: каждые 5 минут
 echo '*/5 * * * * root /usr/local/bin/node-ips' > /etc/cron.d/node-ips
 chmod 644 /etc/cron.d/node-ips
@@ -198,6 +182,6 @@ if grep -Eiq '^\s*(AllowUsers|AllowGroups)\b' /etc/ssh/sshd_config /etc/ssh/sshd
     echo "⚠ В sshd задан AllowUsers/AllowGroups — добавьте туда $user и перезапустите ssh"
 fi
 
-# Первый прогон: запоминаем конец лога и обрезаем его, дальше собираем только новое
+# Первый прогон: запоминаем конец лога, дальше собираем только новое
 /usr/local/bin/node-ips
 echo "OK: сбор каждые 5 минут в $dir/out, забирает только ключ главного сервера"
