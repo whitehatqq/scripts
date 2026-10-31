@@ -127,12 +127,13 @@ load_line() {
     oom=$(journalctl -k --cursor-file="$state/oom.cursor" --since "-10 min" --no-pager -q 2>/dev/null | grep -c 'Killed process' || true)
 
     # Как выходит сам xray: его исходящие соединения — «свой IP, куда, порт». Входящие на 443
-    # и соединения внутри сервера (fallback на 127.0.0.1) не считаем
+    # и соединения внутри сервера (fallback на 127.0.0.1) не считаем. У привязанного к
+    # интерфейсу соединения ss пишет «IP%интерфейс:порт» — интерфейс отрезаем
     pid=$(pgrep -xo xray || true)
     if [ -n "$pid" ]; then
         xout=$(ss -Htnp state established 2>/dev/null | awk -v p="pid=$pid," '
             index($0, p) && $3 !~ /:443$/ {
-                l = $3; sub(/:[0-9]+$/, "", l); gsub(/\[|\]/, "", l)
+                l = $3; sub(/:[0-9]+$/, "", l); gsub(/\[|\]/, "", l); sub(/%.*/, "", l)
                 r = $4; port = r; sub(/.*:/, "", port); sub(/:[0-9]+$/, "", r); gsub(/\[|\]/, "", r)
                 if (l !~ /^127\./ && l != "::1" && r !~ /^127\./ && r != "::1") print l, r, port
             }')
