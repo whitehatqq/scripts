@@ -1,32 +1,44 @@
 #!/bin/bash
-# Сбор с ноды для главного сервера: пары «клиент + IP», попытки торрента и баны блокеров.
-# Нода раз в 5 минут складывает их в файл, главный сервер забирает по SSH ключом, который
-# умеет только это. Сайты, которые открывают клиенты, никуда не уходят. Журнал Xray скрипт
-# только читает: ротацию журнала настраивают отдельно, вместе с логом в ядре.
+# Сбор с ноды для главного сервера: пары «клиент + IP», попытки торрента, баны блокеров и
+# нагрузка ноды. Нода раз в 5 минут складывает их в файл, главный сервер забирает по SSH
+# ключом, который умеет только это. Сайты, которые открывают клиенты, никуда не уходят. Журнал
+# Xray скрипт только читает: ротацию журнала настраивают отдельно, вместе с логом в ядре.
 #
 # Строки файла:
 #   123456 203.0.113.10                           — пара: клиент и IP
 #   T 123456 203.0.113.10 14                      — 14 попыток в TORRENT за 5 минут
 #   B 1761660300 tblocker 123456 203.0.113.10 10  — бан: время (unix), источник, клиент, IP, минут
+#   L mem_total=3915 mem_avail=643 cpu=16 st=1 rx=14 tx=14 conn=2417 xray_up=167000 oom=0 exit_ms=9 exit_ip=203.0.113.10 disk=41
+#                                                 — нагрузка: память (МБ), CPU и steal (%), канал
+#                                                   (Мбит/с), соединений на 443, сколько работает xray
+#                                                   (сек), убито по памяти, проверка выхода (мс, пусто —
+#                                                   нет ответа), выходной IP, диск (%)
 # Источники бана: tblocker (xray-torrent-blocker), p2pban (по поведению), p2pban_extend
 # (p2pban продлил бан блокера при повторах)
 #
 # Установка:  bash node-ips.sh            (спросит публичный ключ главного сервера)
 #             NODEIPS_KEY='ssh-ed25519 AAAA…' bash node-ips.sh
-# Обновление: bash node-ips.sh            (ключ уже стоит — не спрашивает)
+# Обновление: bash node-ips.sh            (ключ и проверка выхода уже стоят — не спрашивает)
 # Удаление:   bash node-ips.sh --remove
+#
+# Проверка выхода (exit_ms, exit_ip). По умолчанию — generate_204 через маршрут по умолчанию:
+#   NODEIPS_EXIT_IF=ens19 bash node-ips.sh    — нода выходит в интернет через другой интерфейс
+#   NODEIPS_EXIT_CHECK='tcp:203.0.113.20:443 tcp:203.0.113.21:443' NODEIPS_EXIT_IP=0 bash node-ips.sh
+#                                             — промежуточная нода: меряем подключение к выходным,
+#                                               в exit_ms — худшее, свой выходной IP не нужен
 set -euo pipefail
 
 user=nodeips
 dir=/var/lib/node-ips
 log=/var/lib/pg-node/access.log
+conf=/etc/node-ips.conf
 
 # Нужен root
 [ "$(id -u)" = 0 ] || { echo "Запустите от root"; exit 1; }
 
-# Удаление: пользователь, скрипты, cron и данные
+# Удаление: пользователь, скрипты, cron, настройки и данные
 if [ "${1:-}" = "--remove" ]; then
-    rm -f /etc/cron.d/node-ips /usr/local/bin/node-ips /usr/local/bin/node-ips-get
+    rm -f /etc/cron.d/node-ips /usr/local/bin/node-ips /usr/local/bin/node-ips-get "$conf"
     id "$user" >/dev/null 2>&1 && userdel "$user"
     rm -rf "$dir"
     echo "Удалено"
@@ -57,16 +69,115 @@ chown -R "$user:$user" "$dir"
 chmod 700 "$dir/.ssh" && chmod 600 "$dir/.ssh/authorized_keys"
 chmod 755 "$dir" && chmod 770 "$dir/out"
 
-# Сборщик: новые строки лога и журналов блокеров → файл с отметкой времени
+# Проверка выхода: из переменных, иначе из прошлой установки, иначе по умолчанию. Значения
+# сверяем с шаблоном — сборщик подставляет их в команды
+if [ -n "${NODEIPS_EXIT_IF+x}${NODEIPS_EXIT_CHECK+x}${NODEIPS_EXIT_IP+x}" ] || [ ! -f "$conf" ]; then
+    exit_if=${NODEIPS_EXIT_IF:-}
+    exit_check=${NODEIPS_EXIT_CHECK:-https://www.google.com/generate_204}
+    exit_ip=${NODEIPS_EXIT_IP:-1}
+    [[ "$exit_if" =~ ^[A-Za-z0-9_.-]*$ ]] || { echo "Неверный NODEIPS_EXIT_IF"; exit 1; }
+    check_re='^((https?://[A-Za-z0-9.:/_-]+|tcp:[A-Za-z0-9.-]+:[0-9]+)( |$))+$'
+    [[ "$exit_check" =~ $check_re ]] || { echo "Неверный NODEIPS_EXIT_CHECK"; exit 1; }
+    [[ "$exit_ip" =~ ^[01]$ ]] || { echo "NODEIPS_EXIT_IP — 0 или 1"; exit 1; }
+    printf 'EXIT_IF=%s\nEXIT_CHECK=%s\nEXIT_IP=%s\n' "$exit_if" "$exit_check" "$exit_ip" > "$conf"
+    chmod 644 "$conf"
+fi
+
+# Сборщик: новые строки лога и журналов блокеров, нагрузка ноды → файл с отметкой времени
 cat > /usr/local/bin/node-ips <<'EOF'
 #!/bin/bash
-# Раз в 5 минут: пары «клиент + IP», попытки торрента и баны блокеров
+# Раз в 5 минут: пары «клиент + IP», попытки торрента, баны блокеров и нагрузка ноды
 set -eu
 export LC_ALL=C
 log=/var/lib/pg-node/access.log
 state=/var/lib/node-ips
 out=$state/out
 pos_file=$state/pos
+
+# Нагрузка ноды одной строкой «L имя=значение…». Пустое значение — не измерили: CPU и канал
+# считаются от прошлого запуска, первый после установки или перезагрузки их не знает
+load_line() {
+    local now mem_total mem_avail cpu='' st='' rx='' tx='' conn up oom exit_ms='' exit_ip='' disk
+    local c1 c2 c3 c4 c5 c6 c7 c8 p1 p2 p3 p4 p5 p6 p7 p8 total rxb=0 txb=0 pt prx ptx d
+    local exit_if='' exit_check='https://www.google.com/generate_204' want_ip=1 k v t worst=0 ok=1 ms r hp h p s
+    now=$(date +%s)
+
+    # Память, МБ: всего и доступно (MemAvailable — с учётом кеша, который можно отдать)
+    mem_total=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+    mem_avail=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+
+    # CPU и steal, % с прошлого запуска. Поля /proc/stat: user nice system idle iowait irq softirq steal
+    read -r _ c1 c2 c3 c4 c5 c6 c7 c8 _ < /proc/stat
+    if read -r p1 p2 p3 p4 p5 p6 p7 p8 2>/dev/null < "$state/cpu"; then
+        total=$(( (c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8) - (p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8) ))
+        if [ "$total" -gt 0 ]; then
+            cpu=$(( ((c1 + c2 + c3 + c6 + c7) - (p1 + p2 + p3 + p6 + p7)) * 100 / total ))
+            st=$(( (c8 - p8) * 100 / total ))
+        fi
+    fi
+    echo "$c1 $c2 $c3 $c4 $c5 $c6 $c7 $c8" > "$state/cpu"
+
+    # Канал, Мбит/с с прошлого запуска: сумма по физическим интерфейсам (туннели вроде warp
+    # и docker не считаем — их трафик уже прошёл через физический). Счётчики обнулились — пропуск
+    for d in /sys/class/net/*; do
+        [ -e "$d/device" ] || continue
+        rxb=$(( rxb + $(cat "$d/statistics/rx_bytes") ))
+        txb=$(( txb + $(cat "$d/statistics/tx_bytes") ))
+    done
+    if read -r pt prx ptx 2>/dev/null < "$state/net" && [ "$now" -gt "$pt" ] && [ "$rxb" -ge "$prx" ] && [ "$txb" -ge "$ptx" ]; then
+        rx=$(( (rxb - prx) * 8 / (now - pt) / 1000000 ))
+        tx=$(( (txb - ptx) * 8 / (now - pt) / 1000000 ))
+    fi
+    echo "$now $rxb $txb" > "$state/net"
+
+    # Открытых входящих на 443 и сколько секунд работает xray (не запущен — 0)
+    conn=$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)
+    up=$(ps -o etimes= -C xray 2>/dev/null | sort -n | tail -n 1 | tr -d ' ')
+
+    # Убито за нехваткой памяти с прошлого запуска: курсор помнит, где остановились
+    oom=$(journalctl -k --cursor-file="$state/oom.cursor" --since "-10 min" --no-pager -q 2>/dev/null | grep -c 'Killed process' || true)
+
+    # Проверка выхода: настройки ставит установщик
+    if [ -f /etc/node-ips.conf ]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                EXIT_IF) exit_if=$v ;;
+                EXIT_CHECK) exit_check=$v ;;
+                EXIT_IP) want_ip=$v ;;
+            esac
+        done < /etc/node-ips.conf
+    fi
+
+    # Каждая цель: адрес — запрос целиком, tcp:хост:порт — только подключение. В exit_ms — худшее,
+    # хоть одна не ответила — пусто
+    for t in $exit_check; do
+        ms=''
+        case "$t" in
+            tcp:*)
+                hp=${t#tcp:}; h=${hp%:*}; p=${hp##*:}
+                s=$(date +%s%N)
+                if timeout 5 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; then ms=$(( ($(date +%s%N) - s) / 1000000 )); fi
+                ;;
+            *)
+                r=$(curl -4 -s ${exit_if:+--interface "$exit_if"} --max-time 5 -o /dev/null -w '%{http_code} %{time_total}' "$t" 2>/dev/null || true)
+                if [ -n "$r" ] && [ "${r%% *}" != 000 ]; then ms=$(awk -v t="${r##* }" 'BEGIN {printf "%d", t * 1000}'); fi
+                ;;
+        esac
+        if [ -z "$ms" ]; then ok=0; elif [ "$ms" -gt "$worst" ]; then worst=$ms; fi
+    done
+    if [ "$ok" = 1 ]; then exit_ms=$worst; fi
+
+    # С какого IP нода выходит в интернет: хостинг может подменить его на свой
+    if [ "$want_ip" = 1 ]; then
+        exit_ip=$(curl -4 -s ${exit_if:+--interface "$exit_if"} --max-time 5 https://api.ipify.org 2>/dev/null || true)
+        [[ "$exit_ip" =~ ^[0-9a-fA-F.:]+$ ]] || exit_ip=''
+    fi
+
+    # Занято на диске, %
+    disk=$(df -P / | awk 'NR == 2 {sub(/%/, "", $5); print $5}')
+
+    echo "L mem_total=$mem_total mem_avail=$mem_avail cpu=$cpu st=$st rx=$rx tx=$tx conn=$conn xray_up=${up:-0} oom=$oom exit_ms=$exit_ms exit_ip=$exit_ip disk=$disk"
+}
 
 # Один запуск за раз: ручной запуск во время крона дождётся его конца
 exec 9>"$state/lock"
@@ -130,6 +241,9 @@ file="$out/$(date -u +%Y%m%d%H%M).txt"
         }
         if (kind != "" && id ~ /^[0-9]+$/ && ip ~ /^[0-9a-fA-F.:]+$/ && m ~ /^[0-9]+$/) print "B " int($1) " " kind " " id " " ip " " m
     }' || true
+
+    # Нагрузка ноды: сбой одной проверки не должен оставить ноду без пар
+    load_line || true
 } | sort -u > "$file.tmp"
 rm -f "$chunk"
 
